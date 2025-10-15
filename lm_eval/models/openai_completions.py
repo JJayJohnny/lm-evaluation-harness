@@ -12,7 +12,11 @@ from lm_eval.api.model import LM, TemplateLM
 from lm_eval.api.registry import register_model
 from lm_eval.models.utils import retry_on_specific_exceptions
 from lm_eval.utils import eval_logger
-
+import time
+import uuid
+import requests as re
+import urllib3
+from dotenv import load_dotenv
 
 def get_result(response) -> Tuple[float, bool]:
     """Process results from OpenAI API response.
@@ -562,3 +566,187 @@ class OpenaiChatCompletionsLM(LM):
 
     def loglikelihood_rolling(self, requests, disable_tqdm: bool = False):
         raise NotImplementedError("No support for logits.")
+
+
+@register_model("bielik-remote-chat-completions")
+class BielikChatCompletions(LM):
+    def __init__(
+        self,
+        model: str = "speakleash/Bielik-11B-v2.2-Instruct",  # GPT model or Local model using HuggingFace model paths
+        base_url: str = None,
+        truncate: bool = False,
+        **kwargs,
+    ) -> None:
+        """
+
+        :param model: str
+            Implements an OpenAI-style chat completion API for
+            accessing both OpenAI OR locally-hosted models using
+            HuggingFace Tokenizer
+            OpenAI API model (e.g. gpt-3.5-turbo)
+            using the **gen_kwargs passed on init
+        :param truncate: bool
+            Truncate input if too long (if False and input is too long, throw error)
+        """
+        super().__init__()
+
+        load_dotenv(".env")
+        assert "LLM_USERNAME" in os.environ, f"Environment variable LLM_USERNAME must be set"
+        assert "LLM_PASSWORD" in os.environ, f"Environment variable LLM_PASSWORD must be set"
+        assert "LLM_URL" in os.environ, f"Environment variable LLM_URL must be set"
+
+        self.model = model
+        self.base_url = os.getenv("LLM_URL")
+        self.truncate = truncate
+        self.username = os.getenv("LLM_USERNAME")
+        self.password = os.getenv("LLM_PASSWORD")
+
+    @property
+    def max_length(self) -> int:
+        # Note: the OpenAI API supports up to 2049 tokens, with the first token being the first input token
+        return 2048
+
+    @property
+    def max_gen_toks(self) -> int:
+        return 256
+
+    @property
+    def batch_size(self):
+        # Isn't used because we override _loglikelihood_tokens
+        raise NotImplementedError()
+
+    @property
+    def device(self):
+        # Isn't used because we override _loglikelihood_tokens
+        raise NotImplementedError()
+
+    def generate_until(self, requests, disable_tqdm: bool = False) -> List[str]:
+        res = defaultdict(list)
+        re_ords = {}
+
+        # we group requests by their generation_kwargs,
+        # so that we don't try to execute e.g. greedy sampling and temp=0.8 sampling
+        # in the same batch.
+        grouper = lm_eval.models.utils.Grouper(requests, lambda x: str(x.args[1]))
+        for key, reqs in grouper.get_grouped().items():
+            # within each set of reqs for given kwargs, we reorder by token length, descending.
+            re_ords[key] = utils.Reorderer(
+                [req.args for req in reqs], lambda x: (-len(x[0]), x[0])
+            )
+
+        pbar = tqdm(total=len(requests), disable=(disable_tqdm or (self.rank != 0)))
+        for key, re_ord in re_ords.items():
+            # n needs to be 1 because messages in
+            # chat completion are not batch but
+            # is regarded as a single conversation.
+            chunks = lm_eval.models.utils.chunks(re_ord.get_reordered(), n=1)
+            for chunk in chunks:
+                contexts, all_gen_kwargs = zip(*chunk)
+                inps = [{"role": "user", "content": context} for context in contexts]
+
+                gen_kwargs = all_gen_kwargs[0]
+                until = None
+                if isinstance(kwargs := copy.deepcopy(gen_kwargs), dict):
+                    if "do_sample" in kwargs.keys():
+                        kwargs.pop("do_sample")
+                    if "until" in kwargs.keys():
+                        until = kwargs.pop("until")
+                        if isinstance(until, str):
+                            until = [until]
+                        elif not isinstance(until, list):
+                            raise ValueError(
+                                f"Expected repr(kwargs['until']) to be of type Union[str, list] but got {until}"
+                            )
+                        kwargs["stop"] = until
+                    kwargs["max_tokens"] = kwargs.pop("max_gen_toks", self.max_gen_toks)
+                else:
+                    raise ValueError(
+                        f"Expected repr(kwargs) to be of type repr(dict) but got {kwargs}"
+                    )
+                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+                auth = (self.username, self.password)
+                auth_kwargs = {"auth": auth, "verify": False}
+                data = {
+                    "messages": inps,
+                    "max_length": kwargs['max_tokens'],
+                    "temperature": kwargs['temperature'],
+                }
+                retries = 0
+                while retries < 5:
+                    try:
+                        response = re.put(
+                            url=self.base_url,
+                            json=data,
+                            headers={
+                                "Accept": "application/json",
+                                "Content-Type": "application/json",
+                            },
+                            **auth_kwargs,
+                        )
+                        response.raise_for_status()
+                        break
+                    except re.exceptions.HTTPError as e:
+                        print(f"HTTP error occurred: {e} retry: {retries}")
+                    retries += 1
+                    if retries >= 5:
+                        raise e
+                    time.sleep(retries)
+
+                response = to_chat_completion(response.json(), model_name=self.model)
+                
+                for resp, (context, args_) in zip(response['choices'], chunk):
+                    s = resp['message']['content']
+
+                    if until is not None:
+                        for term in until:
+                            if len(term) > 0:
+                                s = s.split(term)[0]
+
+                    res[key].append(s)
+
+                    self.cache_hook.add_partial(
+                        "generate_until", (context, {"until": until}), s
+                    )
+                    pbar.update(1)
+            # reorder this group of results back to original unsorted form
+            res[key] = re_ord.get_original(res[key])
+
+        pbar.close()
+
+        return grouper.get_original(res)
+
+    def loglikelihood(self, requests, disable_tqdm: bool = False):
+        raise NotImplementedError("No support for logits.")
+
+    def loglikelihood_rolling(self, requests, disable_tqdm: bool = False):
+        raise NotImplementedError("No support for logits.")
+    
+def to_chat_completion(raw_response, model_name="gpt-4o-mini"):
+    """
+    Przekształca uproszczoną odpowiedź {"response": "..."}
+    w strukturę zgodną z OpenAI ChatCompletion API.
+    """
+    content = raw_response.get("response", "")
+    
+    chat_completion = {
+        "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model_name,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": content
+                },
+                "finish_reason": "stop"
+            }
+        ],
+        "usage": {
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "total_tokens": None
+        }
+    }
+    return chat_completion
