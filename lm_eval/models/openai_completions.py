@@ -575,6 +575,8 @@ class BielikChatCompletions(LM):
         model: str = "speakleash/Bielik-11B-v2.2-Instruct",  # GPT model or Local model using HuggingFace model paths
         base_url: str = None,
         truncate: bool = False,
+        side: Optional[str] = None,
+        version: Optional[str] = None,
         **kwargs,
     ) -> None:
         """
@@ -600,6 +602,34 @@ class BielikChatCompletions(LM):
         self.truncate = truncate
         self.username = os.getenv("LLM_USERNAME")
         self.password = os.getenv("LLM_PASSWORD")
+
+        if side:
+            assert version is not None, "If side is set, version must be set too"
+            self.adapter_name = f"opposing_views__{side}_lora_module"
+            self.adapter_version = version
+            self.load_lora_adapter()
+        
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    def load_lora_adapter(self):
+        print(f"LOADING LORA ADAPTER {self.adapter_name} version {self.adapter_version}")
+        auth = (self.username, self.password)
+        auth_kwargs = {"auth": auth, "verify": False}
+
+        lora_data = {
+            "lora_adapter": self.adapter_name,
+            "lora_adapter_version": self.adapter_version,
+        }
+
+        response = re.post(
+            f"{self.base_url}/lora",
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            json=lora_data,
+            **auth_kwargs,
+        )
+
+        print(response.json())
+        response.raise_for_status()
 
     @property
     def max_length(self) -> int:
@@ -663,7 +693,7 @@ class BielikChatCompletions(LM):
                     raise ValueError(
                         f"Expected repr(kwargs) to be of type repr(dict) but got {kwargs}"
                     )
-                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
                 auth = (self.username, self.password)
                 auth_kwargs = {"auth": auth, "verify": False}
                 data = {
@@ -671,11 +701,15 @@ class BielikChatCompletions(LM):
                     "max_length": kwargs['max_tokens'],
                     "temperature": kwargs['temperature'],
                 }
+
+                if self.adapter_name:
+                    data["lora_adapter"] = self.adapter_name
+
                 retries = 0
                 while retries < 5:
                     try:
                         response = re.put(
-                            url=self.base_url,
+                            url=f'{self.base_url}/prompt/chat',
                             json=data,
                             headers={
                                 "Accept": "application/json",
